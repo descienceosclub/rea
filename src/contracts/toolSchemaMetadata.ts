@@ -1,3 +1,7 @@
+import {
+  JsonSchemaReferences,
+  type JsonSchemaScope,
+} from "./jsonSchemaReferences.js";
 import { z } from "zod";
 
 import type { ToolContract } from "./toolContractTypes.js";
@@ -10,6 +14,7 @@ import {
   schemaLiteralValues,
 } from "./jsonSchemaKeywords.js";
 import { digestCanonicalValue } from "../domain/canonicalDigest.js";
+import { getEvidenceInputContract } from "../domain/evidenceInputContract.js";
 
 const PROPERTY_DESCRIPTIONS: Readonly<Record<string, string>> = {
   addresses: "Ordered provider-normalized procedure addresses to analyze.",
@@ -58,30 +63,68 @@ const PROPERTY_DESCRIPTIONS: Readonly<Record<string, string>> = {
 
 type JsonSchemaProjection = z.ZodType["~standard"]["jsonSchema"]["input"];
 
+// Contracts are immutable module values. Build each advertised wrapper once so
+// its memoized projection serves every server in the process, not only the
+// server that registered it.
+const advertisedInputSchemas = new WeakMap<ToolContract, z.ZodType>();
+const advertisedOutputSchemas = new WeakMap<ToolContract, z.ZodType>();
+
+const oncePerContract = <
+  Contract extends ToolContract,
+  Schema extends z.ZodType,
+>(
+  cache: WeakMap<ToolContract, z.ZodType>,
+  contract: Contract,
+  build: () => Schema,
+): Schema => {
+  const cached = cache.get(contract);
+  if (cached !== undefined) return cached as Schema;
+  const built = build();
+  cache.set(contract, built);
+  return built;
+};
+
 /** Attach caller guidance to a canonical schema for the SDK wire projection. */
 export const toolInputSchemaWithMetadata = <Contract extends ToolContract>(
   contract: Contract,
 ): Contract["inputSchema"] =>
-  withAdvertisedJsonSchema(
-    contract.inputSchema,
-    "input",
-    (project) => (options) => {
-      const inline = project({
-        ...options,
-        libraryOptions: { ...options.libraryOptions, reused: "inline" },
-      });
-      const examples = advertisedInputExamples(contract);
-      return {
-        // Keep advertised parameters self-contained for clients that do not
-        // resolve local references. The registered canonical schema remains
-        // responsible for runtime validation.
-        ...presentInputJsonSchema(inline, fallbackPropertyDescription),
-        ...(examples.length === 0 ? {} : { examples }),
-      };
-    },
+  oncePerContract(advertisedInputSchemas, contract, () =>
+    withAdvertisedJsonSchema(
+      contract.inputSchema,
+      "input",
+      (project) => (options) => {
+        const inline = project({
+          ...options,
+          libraryOptions: { ...options.libraryOptions, reused: "inline" },
+        });
+        const examples = advertisedInputExamples(contract);
+        const presented = presentInputJsonSchema(
+          inline,
+          fallbackPropertyDescription,
+        );
+        const sourceGuidance = getEvidenceInputContract(contract.inputSchema)
+          .hasEvidence
+          ? 'Declared Evidence fields accept complete records or {"kind":"retained-evidence","evidence_id":"ev_..."}. For a complete source, use the summary\'s parent_evidence_id.'
+          : undefined;
+        return {
+          // Keep advertised parameters self-contained for clients that do not
+          // resolve local references. The registered canonical schema remains
+          // responsible for runtime validation.
+          ...presented,
+          ...(sourceGuidance === undefined
+            ? {}
+            : {
+                description: [presented.description, sourceGuidance]
+                  .filter((text) => typeof text === "string")
+                  .join(" "),
+              }),
+          ...(examples.length === 0 ? {} : { examples }),
+        };
+      },
+    ),
   );
 
-/** Return the same complete input JSON Schema projection registered on MCP. */
+/** Return the full-profile advertised input JSON Schema registered on MCP. */
 export const advertisedInputJsonSchema = <Contract extends ToolContract>(
   contract: Contract,
 ): Record<string, unknown> =>
@@ -93,25 +136,28 @@ export const advertisedInputJsonSchema = <Contract extends ToolContract>(
 export const toolOutputSchemaWithMetadata = <Contract extends ToolContract>(
   contract: Contract,
 ): Contract["outputSchema"] =>
-  withAdvertisedJsonSchema(
-    contract.outputSchema,
-    "output",
-    (project) => (options) => {
-      const shared = project({
-        ...options,
-        libraryOptions: { reused: "ref", ...options.libraryOptions },
-      });
-      // An explicit ID owns the reference base. Relative external references
-      // also depend on that base, so leave those projections unchanged.
-      if ("$id" in shared || hasRelativeSchemaReference(shared)) return shared;
-      return {
-        ...shared,
-        $id: `urn:rea:tool-output:sha256:${digestCanonicalValue(
-          { target: options.target, schema: shared },
-          "Tool output schema",
-        )}`,
-      };
-    },
+  oncePerContract(advertisedOutputSchemas, contract, () =>
+    withAdvertisedJsonSchema(
+      contract.outputSchema,
+      "output",
+      (project) => (options) => {
+        const shared = project({
+          ...options,
+          libraryOptions: { reused: "ref", ...options.libraryOptions },
+        });
+        // An explicit ID owns the reference base. Relative external references
+        // also depend on that base, so leave those projections unchanged.
+        if ("$id" in shared || hasRelativeSchemaReference(shared))
+          return shared;
+        return {
+          ...shared,
+          $id: `urn:rea:tool-output:sha256:${digestCanonicalValue(
+            { target: options.target, schema: shared },
+            "Tool output schema",
+          )}`,
+        };
+      },
+    ),
   );
 
 /**
@@ -164,10 +210,14 @@ const hasRelativeSchemaReference = (
 ): boolean => {
   // Local pointers can make even annotation values executable schemas. Keep
   // their resource root and traversal role separate from ordinary instance data.
-  const pending: { value: unknown; root: object; position: SchemaPosition }[] =
-    [{ value: schema, root: schema, position: "schema" }];
+  const references = new JsonSchemaReferences(schema);
+  const pending: {
+    value: unknown;
+    scope: JsonSchemaScope | undefined;
+    position: SchemaPosition;
+  }[] = [{ value: schema, scope: references.rootScope, position: "schema" }];
   const visited = new WeakMap<
-    object,
+    JsonSchemaScope,
     Record<SchemaPosition, WeakSet<object>>
   >();
   while (pending.length > 0) {
@@ -175,26 +225,24 @@ const hasRelativeSchemaReference = (
     const current = entry.value;
     if (current === null || typeof current !== "object") continue;
     const { position } = entry;
-    const root =
-      position !== "map" &&
-      isSchemaRecord(current) &&
-      typeof current.$id === "string" &&
-      URL.canParse(current.$id)
-        ? current
-        : entry.root;
-    let positions = visited.get(root);
+    const scope =
+      position !== "map" && isSchemaRecord(current)
+        ? references.enter(current, entry.scope)
+        : entry.scope;
+    if (scope === undefined) return true;
+    let positions = visited.get(scope);
     if (positions === undefined) {
       positions = {
         schema: new WeakSet(),
         map: new WeakSet(),
         unknown: new WeakSet(),
       };
-      visited.set(root, positions);
+      visited.set(scope, positions);
     }
     if (positions[position].has(current)) continue;
     positions[position].add(current);
     if (Array.isArray(current)) {
-      for (const value of current) pending.push({ value, root, position });
+      for (const value of current) pending.push({ value, scope, position });
       continue;
     }
     for (const [key, value] of Object.entries(current)) {
@@ -203,14 +251,15 @@ const hasRelativeSchemaReference = (
         ["$id", "$ref", "$dynamicRef", "$recursiveRef"].includes(key) &&
         typeof value === "string"
       ) {
+        if (key === "$dynamicRef" || key === "$recursiveRef") return true;
         if (!value.startsWith("#") && !URL.canParse(value)) return true;
         if (key !== "$id" && value.startsWith("#")) {
-          const target = localSchemaReference(root, value);
+          const target = references.resolve(scope, value);
           // Unknown anchors are already examined at their schema positions.
           // Unresolvable pointers retain the existing reference base.
-          if (target === undefined) return true;
+          if (target.kind === "unresolved") return true;
           if (target.kind === "target")
-            pending.push({ value: target.value, root, position: "schema" });
+            pending.push({ value: target.value, scope, position: "schema" });
         }
       }
       if (position === "schema" && schemaLiteralValues.has(key)) continue;
@@ -224,50 +273,16 @@ const hasRelativeSchemaReference = (
               ? "schema"
               : "unknown";
       if (value !== null && typeof value === "object")
-        pending.push({ value, root, position: childPosition });
+        pending.push({ value, scope, position: childPosition });
     }
   }
   return false;
 };
 
-/** Decode URI-fragment JSON Pointers without interpreting literal data as schemas. */
-const localSchemaReference = (
-  root: object,
-  reference: string,
-): { kind: "target"; value: unknown } | { kind: "anchor" } | undefined => {
-  let fragment: string;
-  try {
-    fragment = decodeURIComponent(reference.slice(1));
-  } catch {
-    return undefined;
-  }
-  if (fragment === "") return { kind: "target", value: root };
-  if (!fragment.startsWith("/")) return { kind: "anchor" };
-  let value: unknown = root;
-  for (const token of fragment.slice(1).split("/")) {
-    if (/~(?:[^01]|$)/u.test(token)) return undefined;
-    const key = token.replaceAll("~1", "/").replaceAll("~0", "~");
-    if (
-      value === null ||
-      typeof value !== "object" ||
-      !Object.hasOwn(value, key)
-    )
-      return undefined;
-    // A pointer can cross a resource boundary even inside literal data.
-    // Preserve the original projection rather than guess the reference scope.
-    if (value !== root && isSchemaRecord(value) && "$id" in value)
-      return undefined;
-    value = Reflect.get(value, key);
-  }
-  return { kind: "target", value };
-};
-
 const withAdvertisedJsonSchema = <Schema extends z.ZodType>(
   canonical: Schema,
   io: "input" | "output",
-  advertise: (project: JsonSchemaProjection) => JsonSchemaProjection = (
-    project,
-  ) => project,
+  advertise: (project: JsonSchemaProjection) => JsonSchemaProjection,
 ): Schema => {
   // Zod's input projection drops root metadata when a descendant transforms.
   // Preserve the parser and let the SDK own conversion of everything else.
